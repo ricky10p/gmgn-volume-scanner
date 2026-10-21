@@ -8,9 +8,15 @@ const clock = () => new Date().toISOString().replace("T", " ").slice(0, 19);
 /**
  * Second Telegram channel.
  *
- * Fires every `repeatMs` while a token's 1m volume has stayed above `minVol` for
- * `sustainMs`, applies the same fee / market-cap filters as channel 1, renders the
- * same full pool message, and deletes each message after `deleteAfterMs`.
+ * Fires every `repeatMs` while a token's 1m volume has stayed *continuously* above
+ * `minVol` for `sustainMs`, applies the same fee / market-cap filters as channel 1,
+ * renders the same full pool message, and deletes each message after `deleteAfterMs`.
+ *
+ * Streak rules (the important part):
+ *   - `since` is the first poll of the current streak; it is reset to 0 the moment
+ *     volume drops below `minVol`, the token disappears from the rank list, or the
+ *     persisted state is older than `staleMs` (i.e. the process was down).
+ *   - a reset never throws away `msgIds` — those messages still have to be deleted.
  */
 export class SustainedChannel {
   constructor({
@@ -24,6 +30,8 @@ export class SustainedChannel {
     deleteAfterMs = 30000,
     requirePool = true,
     poolTypes = ["dlmm"],
+    staleMs = 60000,
+    maxPerCycle = 10,
     stateFile,
     dryRun = false,
   } = {}) {
@@ -37,6 +45,8 @@ export class SustainedChannel {
     this.deleteAfterMs = deleteAfterMs;
     this.requirePool = requirePool;
     this.poolTypes = poolTypes;
+    this.staleMs = staleMs;
+    this.maxPerCycle = maxPerCycle;
     this.stateFile = stateFile;
     this.dryRun = dryRun;
     this.state = this.#load();
@@ -47,19 +57,46 @@ export class SustainedChannel {
   }
 
   #load() {
+    let raw = {};
     try {
-      const raw = JSON.parse(fs.readFileSync(this.stateFile, "utf8"));
-      for (const rec of Object.values(raw)) {
-        if (Array.isArray(rec.msgIds)) {
-          rec.msgIds = rec.msgIds
-            .map((m) => (typeof m === "object" && m !== null ? m : { id: m, ts: rec.since }))
-            .filter((m) => Number.isFinite(m.id));
-        }
-      }
-      return raw;
+      raw = JSON.parse(fs.readFileSync(this.stateFile, "utf8"));
     } catch {
       return {};
     }
+
+    const now = Date.now();
+    let resetCount = 0;
+
+    for (const [mint, rec] of Object.entries(raw)) {
+      if (!rec || typeof rec !== "object") {
+        delete raw[mint];
+        continue;
+      }
+      // normalise legacy msgIds: [123] -> [{id, ts}]
+      if (Array.isArray(rec.msgIds)) {
+        rec.msgIds = rec.msgIds
+          .map((m) => (typeof m === "object" && m !== null ? m : { id: m, ts: rec.since || now }))
+          .filter((m) => Number.isFinite(m.id));
+      } else {
+        rec.msgIds = [];
+      }
+
+      // A streak can only be trusted if we were actually watching the token.
+      // After a restart (or a long gap) the persisted `since` is meaningless,
+      // so the token must earn its 3 minutes again.
+      const lastProof = rec.lastSeen || rec.since || 0;
+      if (!lastProof || now - lastProof > this.staleMs) {
+        rec.since = 0;
+        rec.lastSent = 0;
+        resetCount++;
+      }
+      if (!rec.msgIds.length && !rec.since) delete raw[mint];
+    }
+
+    if (resetCount) {
+      console.log(`[${clock()}] ch2: ${resetCount} streak lama di-reset (state basi / proses sempat mati)`);
+    }
+    return raw;
   }
 
   #save() {
@@ -72,6 +109,15 @@ export class SustainedChannel {
     }
   }
 
+  /** Break the streak but keep msgIds so sweep() can still delete the messages. */
+  #breakStreak(mint) {
+    const rec = this.state[mint];
+    if (!rec) return;
+    rec.since = 0;
+    rec.lastSent = 0;
+    if (!rec.msgIds?.length) delete this.state[mint];
+  }
+
   /** Delete messages whose retention window has passed. */
   async sweep() {
     if (!this.enabled || this.dryRun) return 0;
@@ -79,7 +125,7 @@ export class SustainedChannel {
     let deleted = 0;
     let dirty = false;
 
-    for (const rec of Object.values(this.state)) {
+    for (const [mint, rec] of Object.entries(this.state)) {
       if (!rec.msgIds?.length) continue;
       const keep = [];
       for (const m of rec.msgIds) {
@@ -100,6 +146,11 @@ export class SustainedChannel {
       }
       if (keep.length !== rec.msgIds.length) {
         rec.msgIds = keep;
+        dirty = true;
+      }
+      // fully cleaned and no live streak -> drop the record
+      if (!rec.msgIds.length && !rec.since) {
+        delete this.state[mint];
         dirty = true;
       }
     }
@@ -123,19 +174,23 @@ export class SustainedChannel {
     const now = Date.now();
     const seen = new Set();
     let fired = 0;
+    let throttled = 0;
 
     for (const t of tokens) {
       const vol = num(t.volume);
       const mint = t.address;
 
       if (vol < this.minVol) {
-        if (this.state[mint]) delete this.state[mint]; // streak broken
+        this.#breakStreak(mint); // streak broken, messages kept for cleanup
         continue;
       }
       seen.add(mint);
 
-      const rec = (this.state[mint] ||= { since: now, symbol: t.symbol, lastSent: 0, msgIds: [] });
+      let rec = this.state[mint];
+      if (!rec) rec = this.state[mint] = { since: now, symbol: t.symbol, lastSent: 0, msgIds: [], lastSeen: now };
       rec.symbol = t.symbol || rec.symbol;
+      rec.lastSeen = now;
+      if (!rec.since) rec.since = now; // streak restarts after a break
 
       if (now - rec.since < this.sustainMs) continue; // not sustained long enough
       if (now - rec.lastSent < this.repeatMs) continue; // inside this repeat window
@@ -143,6 +198,12 @@ export class SustainedChannel {
       // same filters as channel 1
       if (num(t.gas_fee) < this.minFeeSol) continue;
       if (num(t.market_cap) < this.minMcapUsd) continue;
+
+      // safety valve: never flood one chat with more than N tokens per cycle
+      if (fired >= this.maxPerCycle) {
+        throttled++;
+        continue;
+      }
 
       const held = ((now - rec.since) / 60000).toFixed(1);
 
@@ -189,12 +250,16 @@ export class SustainedChannel {
       }
     }
 
-    // drop tokens that vanished from the list and have no live messages left
+    // tokens that vanished from the rank list: their streak is no longer provable
     for (const mint of Object.keys(this.state)) {
-      if (!seen.has(mint) && !this.state[mint].msgIds?.length) delete this.state[mint];
+      if (!seen.has(mint)) this.#breakStreak(mint);
+    }
+
+    if (throttled) {
+      console.log(`[${clock()}] ch2: ${throttled} token ditahan (batas ${this.maxPerCycle} per siklus)`);
     }
 
     this.#save();
-    return { fired, tracking: seen.size };
+    return { fired, tracking: seen.size, throttled };
   }
 }

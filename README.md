@@ -119,6 +119,7 @@ Semua pengaturan ada di file `.env`. Setelah mengubah, jalankan `./run.sh restar
 | `TG2_SUSTAIN_MIN` | `3` | harus bertahan di atas ambang selama N menit |
 | `TG2_REPEAT_SEC` | `5` | kirim ulang tiap N detik |
 | `TG2_DELETE_AFTER_SEC` | `30` | hapus tiap pesan setelah N detik |
+| `TG2_MAX_PER_CYCLE` | `10` | batas token per siklus (anti-flood) |
 
 Filter fee dan market cap channel 2 **otomatis mengikuti channel 1** (`GMGN_MIN_FEE_SOL` dan
 `GMGN_MIN_MCAP_USD`).
@@ -172,8 +173,9 @@ Alur kerja, berurutan:
 Channel kedua yang perilakunya berlawanan: tanpa cooldown, frekuensi tinggi.
 
 - Token mulai dihitung "streak" saat volume `1m` pertama kali menyentuh `>= $50K`
-- Streak **direset ke nol** begitu volume turun di bawah ambang — jadi hanya aktivitas yang benar-benar
-  konsisten yang lolos
+- Streak **direset ke nol** begitu volume turun di bawah ambang, **token hilang dari rank list**, atau
+  **state tersimpan lebih tua dari 3 siklus polling** (proses mati / jeda panjang). Streak tidak pernah
+  dipercaya menyeberangi restart — token harus membuktikan 3 menitnya lagi
 - Setelah streak melewati **3 menit**, pesan dikirim tiap **5 detik** selama streak masih berjalan
 - Filter fee (`>= 3 SOL`) dan market cap (`>= $100K`) sama seperti channel 1, dicek saat pengiriman
   supaya penurunan sesaat tidak membuang streak volume yang sudah panjang

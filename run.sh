@@ -84,7 +84,9 @@ case "${1:-status}" in
   status)  status ;;
   logs)    tail -f "$LOG" ;;
   test)
-    "$NODE" test/mock.test.mjs && "$NODE" test/regression.test.mjs
+    "$NODE" test/mock.test.mjs &&
+      "$NODE" test/regression.test.mjs &&
+      "$NODE" test/channel2.test.mjs
     ;;
   once)    "$NODE" "$SCRIPT" --once ;;
   dry)     "$NODE" "$SCRIPT" --once --dry-run ;;

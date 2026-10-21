@@ -108,6 +108,7 @@ const CH2 = {
   sustainMs: numArg(args["ch2-sustain"], env.TG2_SUSTAIN_MIN, 3) * 60000,
   repeatMs: numArg(args["ch2-repeat"], env.TG2_REPEAT_SEC, 5) * 1000,
   deleteAfterMs: numArg(args["ch2-delete"], env.TG2_DELETE_AFTER_SEC, 30) * 1000,
+  maxPerCycle: numArg(args["ch2-max-per-cycle"], env.TG2_MAX_PER_CYCLE, 10),
 };
 
 if (!PERIODS.includes(CFG.period)) {
@@ -144,6 +145,9 @@ const ch2 = new SustainedChannel({
   deleteAfterMs: CH2.deleteAfterMs,
   requirePool: CFG.requirePool,
   poolTypes: CFG.poolTypes,
+  // a streak older than 3 polls cannot be trusted (process restart / long gap)
+  staleMs: Math.max(CFG.pollMs * 3, 60000),
+  maxPerCycle: CH2.maxPerCycle,
   stateFile: path.join(CFG.outDir, "sustained.json"),
   dryRun: CFG.dryRun,
 });
@@ -382,7 +386,8 @@ for (const sig of ["SIGINT", "SIGTERM"]) {
     ch2.enabled
       ? `ch2 up | vol>=${fmtUsd(CH2.minVol)} for ${CH2.sustainMs / 60000}m | ` +
           `fee>=${CFG.minFeeSol} SOL | mcap>=${fmtUsd(CFG.minMcapUsd)} | ` +
-          `repeat ${CH2.repeatMs / 1000}s | delete after ${CH2.deleteAfterMs / 1000}s`
+          `repeat ${CH2.repeatMs / 1000}s | delete after ${CH2.deleteAfterMs / 1000}s | ` +
+          `max ${CH2.maxPerCycle}/cycle`
       : `ch2 off | set TG2_BOT_TOKEN + TG2_CHAT_ID to enable the sustained-volume channel`
   );
 
