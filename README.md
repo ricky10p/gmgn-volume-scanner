@@ -346,11 +346,33 @@ toleransi ±5 detik) + `client_id` (uuid). Key dibuat di https://gmgn.ai/ai.
 ```bash
 ./run.sh test
 # atau
-node test/mock.test.mjs
+node test/mock.test.mjs        # mode tabel (monitor.js) terhadap mock server
+node test/regression.test.mjs  # alert, escaping HTML, chunking, partial-send, merge state
 ```
 
-Menjalankan scanner terhadap mock server lokal dan memverifikasi perhitungan delta, render tabel, dan
-alert spike. Tidak menyentuh API asli.
+Keduanya offline — tidak menyentuh API asli maupun Telegram.
+
+`regression.test.mjs` mengunci bug yang pernah ditemukan:
+
+- simbol token yang mengandung `<`, `>`, `&` tidak boleh merusak `parse_mode=HTML`
+- kegagalan di tengah pengiriman harus mencatat id yang sudah terkirim (`err.sentIds`)
+- re-send tidak boleh menimpa `msgIds` lama (kalau tidak, pesan lama tidak pernah terhapus)
+- `minPoolTvl` harus melaporkan jumlah pool yang benar-benar ditampilkan
+- `pool_type` non-DLMM tidak boleh ikut saat `poolTypes=dlmm`
+
+---
+
+## Batasan yang diketahui
+
+- **Cache pool Meteora 60 detik.** TVL/Vol24 pada alert bisa tertinggal hingga 1 menit. Volume GMGN
+  tetap segar setiap polling.
+- **Maksimal 10 halaman pool** (5.000 pool) per token. Di atas itu dipotong — saat ini token terbesar
+  (TRUMP) punya 396 pool, jadi jauh dari batas.
+- **Polling 5 detik = 12 request/menit** ke GMGN. Jangan diturunkan tanpa alasan.
+- **Penghapusan pesan oleh bot dibatasi Telegram 48 jam.** Nilai `GMGN_DELETE_AFTER_MIN` di atas itu
+  akan gagal diam-diam.
+- **Rate limit Telegram (429)** ditangani dengan satu kali retry mengikuti `retry_after`. Kalau ch2
+  mengirim sangat banyak token sekaligus, sebagian pengiriman bisa tertunda satu siklus.
 
 ---
 

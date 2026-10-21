@@ -17,7 +17,10 @@ is_running() {
   [[ -f "$PIDFILE" ]] || return 1
   local pid
   pid="$(cat "$PIDFILE" 2>/dev/null)"
-  [[ -n "${pid:-}" ]] && kill -0 "$pid" 2>/dev/null
+  [[ -n "${pid:-}" ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  # guard against PID reuse: the pid must actually be our scanner
+  tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q "scan.js"
 }
 
 start() {
@@ -26,6 +29,7 @@ start() {
     return 0
   fi
   echo "starting..."
+  : >>"$LOG"
   nohup "$NODE" "$SCRIPT" >>"$LOG" 2>&1 &
   echo $! >"$PIDFILE"
   sleep 2
@@ -79,7 +83,9 @@ case "${1:-status}" in
   restart) stop; sleep 1; start ;;
   status)  status ;;
   logs)    tail -f "$LOG" ;;
-  test)    "$NODE" test/mock.test.mjs ;;
+  test)
+    "$NODE" test/mock.test.mjs && "$NODE" test/regression.test.mjs
+    ;;
   once)    "$NODE" "$SCRIPT" --once ;;
   dry)     "$NODE" "$SCRIPT" --once --dry-run ;;
   *)

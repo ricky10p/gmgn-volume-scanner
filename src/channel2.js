@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { buildAlert, fmtUsd } from "./alert.js";
+import { buildAlert, escHtml, fmtUsd } from "./alert.js";
 import { sendTelegramBlocks, deleteTelegramMessage } from "./telegram.js";
 
 const num = (v) => (typeof v === "number" ? v : Number(v) || 0);
@@ -48,7 +48,15 @@ export class SustainedChannel {
 
   #load() {
     try {
-      return JSON.parse(fs.readFileSync(this.stateFile, "utf8"));
+      const raw = JSON.parse(fs.readFileSync(this.stateFile, "utf8"));
+      for (const rec of Object.values(raw)) {
+        if (Array.isArray(rec.msgIds)) {
+          rec.msgIds = rec.msgIds
+            .map((m) => (typeof m === "object" && m !== null ? m : { id: m, ts: rec.since }))
+            .filter((m) => Number.isFinite(m.id));
+        }
+      }
+      return raw;
     } catch {
       return {};
     }
@@ -56,7 +64,9 @@ export class SustainedChannel {
 
   #save() {
     try {
-      fs.writeFileSync(this.stateFile, JSON.stringify(this.state));
+      const tmp = `${this.stateFile}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(this.state));
+      fs.renameSync(tmp, this.stateFile);
     } catch {
       /* non-fatal */
     }
@@ -67,6 +77,7 @@ export class SustainedChannel {
     if (!this.enabled || this.dryRun) return 0;
     const now = Date.now();
     let deleted = 0;
+    let dirty = false;
 
     for (const rec of Object.values(this.state)) {
       if (!rec.msgIds?.length) continue;
@@ -77,20 +88,28 @@ export class SustainedChannel {
           continue;
         }
         const r = await deleteTelegramMessage(m.id, { token: this.token, chatId: this.chatId });
-        if (r === "deleted" || r === "already-gone") deleted++;
-        else if (r === "too-old" || r === "forbidden") {
+        if (r === "deleted" || r === "already-gone") {
+          deleted++;
+          dirty = true;
+        } else if (r === "too-old" || r === "forbidden") {
           console.error(`[${clock()}] ch2 delete ${m.id}: ${r}`);
-        } else keep.push(m); // retry next cycle
+          dirty = true;
+        } else {
+          keep.push(m); // retry next cycle
+        }
       }
-      rec.msgIds = keep;
+      if (keep.length !== rec.msgIds.length) {
+        rec.msgIds = keep;
+        dirty = true;
+      }
     }
 
     if (deleted) {
       console.log(
         `[${clock()}] ch2 retention: deleted ${deleted} message(s) older than ${this.deleteAfterMs / 1000}s`
       );
-      this.#save();
     }
+    if (dirty) this.#save();
     return deleted;
   }
 
@@ -125,14 +144,17 @@ export class SustainedChannel {
       if (num(t.gas_fee) < this.minFeeSol) continue;
       if (num(t.market_cap) < this.minMcapUsd) continue;
 
-      if (this.requirePool) {
-        const { pools } = await import("./meteora.js").then((m) =>
-          m.poolsForToken(mint, { types: this.poolTypes })
-        );
-        if (!pools.length) continue;
-      }
-
       const held = ((now - rec.since) / 60000).toFixed(1);
+
+      // build once: this both resolves the pools and applies the pool requirement
+      let built;
+      try {
+        built = await buildAlert(t, { poolTypes: this.poolTypes, requirePool: this.requirePool });
+      } catch (e) {
+        console.error(`[${clock()}] ch2 meteora lookup failed ${rec.symbol}: ${e.message}`);
+        continue;
+      }
+      if (!built) continue; // no pool and requirePool is on
 
       if (this.dryRun) {
         console.log(`[ch2 dry-run] ${rec.symbol} vol ${fmtUsd(vol)} sustained ${held}m`);
@@ -142,13 +164,10 @@ export class SustainedChannel {
       }
 
       try {
-        const built = await buildAlert(t, { poolTypes: this.poolTypes, requirePool: this.requirePool });
-        if (!built) continue;
-
         const ids = await sendTelegramBlocks(built.blocks, {
           token: this.token,
           chatId: this.chatId,
-          header: `🚨 ${built.symbol} · ${held}m stable`,
+          header: `🚨 ${escHtml(built.symbol)} · ${held}m stable`,
         });
         rec.lastSent = now;
         for (const id of ids) rec.msgIds.push({ id, ts: now });
@@ -157,7 +176,16 @@ export class SustainedChannel {
           `[${clock()}] ch2 sent ${rec.symbol} (${fmtUsd(vol)}, ${held}m sustained, ${ids.length} msg) ${ids[0]}`
         );
       } catch (e) {
-        console.error(`[${clock()}] ch2 send failed ${rec.symbol}: ${e.message}`);
+        // partial delivery: keep the ids that made it out so sweep() can delete them
+        if (e.sentIds?.length) {
+          rec.lastSent = now;
+          for (const id of e.sentIds) rec.msgIds.push({ id, ts: now });
+        }
+        console.error(
+          `[${clock()}] ch2 send failed ${rec.symbol}` +
+            (e.sentIds?.length ? ` after ${e.sentIds.length}/${e.totalChunks} msg` : "") +
+            `: ${e.message}`
+        );
       }
     }
 

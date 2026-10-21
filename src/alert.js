@@ -2,14 +2,19 @@ import { poolsForToken } from "./meteora.js";
 
 const nf = new Intl.NumberFormat("en-US");
 
+/** Escape for Telegram parse_mode=HTML. Must be used on every dynamic string. */
+export const escHtml = (s) =>
+  String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
 export const fmtUsd = (v) => {
   if (v == null || !Number.isFinite(v)) return "n/a";
+  const sign = v < 0 ? "-" : "";
   const a = Math.abs(v);
-  if (a >= 1e9) return `$${(v / 1e9).toFixed(2)}B`;
-  if (a >= 1e6) return `$${(v / 1e6).toFixed(2)}M`;
-  if (a >= 1e3) return `$${(v / 1e3).toFixed(1)}K`;
-  if (a >= 1) return `$${Math.round(v)}`;
-  return `$${v.toFixed(2)}`;
+  if (a >= 1e9) return `${sign}$${(a / 1e9).toFixed(2)}B`;
+  if (a >= 1e6) return `${sign}$${(a / 1e6).toFixed(2)}M`;
+  if (a >= 1e3) return `${sign}$${(a / 1e3).toFixed(1)}K`;
+  if (a >= 1) return `${sign}$${Math.round(a)}`;
+  return `${sign}$${a.toFixed(2)}`;
 };
 
 export const fmtSol = (v) =>
@@ -18,7 +23,6 @@ export const fmtSol = (v) =>
 export const fmtNum = (v) => (v == null || !Number.isFinite(v) ? "n/a" : nf.format(Math.round(v)));
 
 const num = (v) => (typeof v === "number" ? v : Number(v) || 0);
-const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 const feePct = (v) => (v == null ? "?" : String(Number(v)));
 
 /**
@@ -28,6 +32,8 @@ const feePct = (v) => (v == null ? "?" : String(Number(v)));
  *   text   — plain text for the log file
  *   blocks — Telegram HTML blocks (header, one per pool, footer). The caller packs
  *            them into messages so a pool entry is never split across two messages.
+ *   pools  — the pools actually listed (after minPoolTvl)
+ *   all    — every pool Meteora returned
  */
 export async function buildAlert(
   token,
@@ -49,6 +55,7 @@ export async function buildAlert(
   const fee = fmtSol(num(token.gas_fee));
   const holders = fmtNum(token.holder_count);
   const gmgnUrl = `https://gmgn.ai/sol/token/${mint}`;
+  const typeLabel = poolTypes.includes("damm") ? "Meteora" : "Meteora DLMM";
 
   // ---------- plain text (log) ----------
   const t = [
@@ -58,7 +65,7 @@ export async function buildAlert(
     `1m Vol: ${vol} | Fee: ${fee} SOL`,
     `Tx: ${swaps} (${buys}/${sells}) | Holders: ${holders}`,
     "",
-    all.length === 0 ? "No Meteora DLMM pool" : `Meteora DLMM (${all.length} pools)`,
+    all.length === 0 ? `No ${typeLabel} pool` : `${typeLabel} (${all.length} pools)`,
   ];
   pools.forEach((p, i) => {
     t.push(
@@ -72,8 +79,8 @@ export async function buildAlert(
 
   blocks.push(
     [
-      `🟢 <b>${esc(symbol)}</b>`,
-      `<code>${esc(mint)}</code>`,
+      `🟢 <b>${escHtml(symbol)}</b>`,
+      `<code>${escHtml(mint)}</code>`,
       "",
       `💰 <b>MC</b> ${mc}  ·  <b>ATH</b> ${ath}`,
       `📈 <b>1m Vol</b> <b>${vol}</b>  ·  <b>Fee</b> ${fee} SOL`,
@@ -82,20 +89,26 @@ export async function buildAlert(
   );
 
   if (all.length === 0) {
-    blocks.push("⚪ <i>No Meteora DLMM pool</i>");
+    blocks.push(`⚪ <i>No ${typeLabel} pool</i>`);
   } else {
     const shown = maxPools === Infinity ? pools : pools.slice(0, maxPools);
-    blocks.push(`💧 <b>Meteora DLMM</b> — ${all.length} pool${all.length === 1 ? "" : "s"}`);
+    // report the count that is actually listed, not the unfiltered total
+    const head =
+      pools.length === all.length
+        ? `${all.length} pool${all.length === 1 ? "" : "s"}`
+        : `${pools.length} of ${all.length} pools`;
+    blocks.push(`💧 <b>${typeLabel}</b> — ${head}`);
 
     shown.forEach((p, i) => {
       blocks.push(
-        `${i + 1}. <a href="https://www.meteora.ag/dlmm/${p.address}">${esc(p.quoteSymbol || "?")}</a>` +
-          `  ·  bin ${p.binStep ?? "?"} / ${feePct(p.baseFee)}%\n` +
-          `     TVL ${fmtUsd(p.tvlUsd)}  ·  Vol24 ${fmtUsd(p.vol24Usd)}`
+        `${i + 1}. <a href="https://www.meteora.ag/dlmm/${p.address}">${escHtml(p.quoteSymbol || "?")}</a>` +
+          `  ·  bin ${p.binStep ?? "?"} / ${feePct(p.baseFee)}%` +
+          `\n     TVL ${fmtUsd(p.tvlUsd)}  ·  Vol24 ${fmtUsd(p.vol24Usd)}`
       );
     });
 
-    if (shown.length < pools.length) blocks.push(`<i>+${pools.length - shown.length} more pools</i>`);
+    const hidden = pools.length - shown.length;
+    if (hidden > 0) blocks.push(`<i>+${hidden} more pools</i>`);
   }
 
   blocks.push(`🔗 <a href="${gmgnUrl}">Open on GMGN</a>`);

@@ -40,10 +40,19 @@ export async function poolsForToken(mint, { ttlMs = 60000, pageSize = 500, types
   const hit = cache.get(key);
   if (hit && Date.now() - hit.ts < ttlMs) return hit.value;
 
-  const url = `${DISCOVERY}/pools?page_size=${pageSize}&page=1&category=all&filter_by=token_x%3D${mint}`;
-  const disc = await getJson(url);
+  // paginate: a handful of tokens have more pools than one page returns
+  const raw = [];
+  let total = Infinity;
+  for (let page = 1; page <= 10; page++) {
+    const url = `${DISCOVERY}/pools?page_size=${pageSize}&page=${page}&category=all&filter_by=token_x%3D${mint}`;
+    const disc = await getJson(url);
+    const rows = disc.data || [];
+    total = Number(disc.total ?? rows.length);
+    raw.push(...rows);
+    if (!rows.length || raw.length >= total) break;
+  }
 
-  const pools = (disc.data || [])
+  const pools = raw
     .filter((p) => types.includes(p.pool_type))
     .map((p) => {
       const base = p.token_x?.address === mint ? p.token_x : p.token_y;
@@ -68,7 +77,7 @@ export async function poolsForToken(mint, { ttlMs = 60000, pageSize = 500, types
     })
     .sort((a, b) => b.tvlUsd - a.tvlUsd);
 
-  const value = { pools, total: pools.length, totalAll: disc.total ?? pools.length };
+  const value = { pools, total: pools.length, totalAll: total === Infinity ? pools.length : total };
   cache.set(key, { ts: Date.now(), value });
   return value;
 }

@@ -2,25 +2,33 @@
 /**
  * GMGN + Meteora scanner.
  *
- * Sorts the GMGN 1m volume rank descending, keeps tokens with
- *   1m volume >= MIN_VOL_USD  AND  cumulative GMGN fee >= MIN_FEE_SOL,
- * enriches each hit with its Meteora SOL DLMM pools and emits one alert per token.
+ * Channel 1: 1m volume rank (sorted desc) filtered by volume / fee / market cap,
+ *            enriched with every Meteora pool for the mint, one alert per token
+ *            with a cooldown applied only after a successful send.
+ * Channel 2: the same filters, but fires every N seconds while a token's 1m volume
+ *            has stayed above its own (higher) threshold for N minutes.
  */
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { GmgnPublic, GmgnOpenApi, PERIODS } from "./gmgn.js";
-import { buildAlert, fmtUsd } from "./alert.js";
+import { buildAlert, escHtml, fmtUsd } from "./alert.js";
 import { telegramConfigured, sendTelegramBlocks, deleteTelegramMessage } from "./telegram.js";
 import { SustainedChannel } from "./channel2.js";
 
-// minimal .env loader (no dependency); real env vars win
-const envFile = path.resolve(".env");
-if (fs.existsSync(envFile)) {
-  for (const line of fs.readFileSync(envFile, "utf8").split("\n")) {
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.resolve(__dirname, "..");
+
+// Minimal .env loader (no dependency); real env vars win.
+// Project .env first, so the script works from any working directory.
+for (const candidate of [path.join(ROOT, ".env"), path.resolve(".env")]) {
+  if (!fs.existsSync(candidate)) continue;
+  for (const line of fs.readFileSync(candidate, "utf8").split("\n")) {
     const m = line.match(/^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.*?)\s*$/);
     if (!m || line.trim().startsWith("#")) continue;
     if (process.env[m[1]] === undefined) process.env[m[1]] = m[2].replace(/^["']|["']$/g, "");
   }
+  break;
 }
 
 function parseArgs(argv) {
@@ -46,27 +54,42 @@ const args = parseArgs(process.argv.slice(2));
 const env = process.env;
 const num = (v) => (typeof v === "number" ? v : Number(v) || 0);
 
+// numeric flag: keep 0 meaningful
+const numArg = (argVal, envVal, dflt) => {
+  if (argVal !== undefined && argVal !== true) return Number(argVal);
+  if (envVal !== undefined && envVal !== "") return Number(envVal);
+  return dflt;
+};
+// boolean flag: --flag / --flag true|false, else env "1"/"0"
+const boolArg = (argVal, envVal, dflt) => {
+  if (argVal === true) return true;
+  if (argVal === "false" || argVal === "0") return false;
+  if (argVal === "true" || argVal === "1") return true;
+  if (envVal === undefined || envVal === "") return dflt;
+  return envVal !== "0" && envVal !== "false";
+};
+
 const CFG = {
   mode: env.GMGN_MODE || (env.GMGN_API_KEY ? "openapi" : "public"),
   chain: args.chain || env.GMGN_CHAIN || "sol",
   period: args.period || env.GMGN_PERIOD || "1m",
-  limit: Number(args.limit || env.GMGN_LIMIT || 100),
-  pollMs: Number(args.poll || env.GMGN_POLL_MS || 5000),
-  minVolUsd: Number(args["min-vol"] || env.GMGN_MIN_VOL_USD || 20000),
-  minFeeSol: Number(args["min-fee"] || env.GMGN_MIN_FEE_SOL || 3),
-  minMcapUsd: Number(args["min-mcap"] ?? env.GMGN_MIN_MCAP_USD ?? 100000),
-  cooldownMs: Number(args.cooldown || env.GMGN_COOLDOWN_MIN || 5) * 60000,
+  limit: numArg(args.limit, env.GMGN_LIMIT, 100),
+  pollMs: numArg(args.poll, env.GMGN_POLL_MS, 5000),
+  minVolUsd: numArg(args["min-vol"], env.GMGN_MIN_VOL_USD, 20000),
+  minFeeSol: numArg(args["min-fee"], env.GMGN_MIN_FEE_SOL, 3),
+  minMcapUsd: numArg(args["min-mcap"], env.GMGN_MIN_MCAP_USD, 100000),
+  cooldownMs: numArg(args.cooldown, env.GMGN_COOLDOWN_MIN, 5) * 60000,
   // 0 = never delete. Telegram lets a bot delete its own messages for 48h.
-  deleteAfterMs: Number(args["delete-after"] ?? env.GMGN_DELETE_AFTER_MIN ?? 0) * 60000,
-  // default ON: a token without a Meteora DLMM pool is never notified
-  requirePool: args["require-pool"] !== undefined ? Boolean(args["require-pool"]) : env.GMGN_REQUIRE_POOL !== "0",
+  deleteAfterMs: numArg(args["delete-after"], env.GMGN_DELETE_AFTER_MIN, 0) * 60000,
+  // default ON: a token without a Meteora pool is never notified
+  requirePool: boolArg(args["require-pool"], env.GMGN_REQUIRE_POOL, true),
   maxPools: args["max-pools"] ? Number(args["max-pools"]) : env.GMGN_MAX_POOLS ? Number(env.GMGN_MAX_POOLS) : Infinity,
-  minPoolTvl: Number(args["min-pool-tvl"] || env.GMGN_MIN_POOL_TVL || 0),
+  minPoolTvl: numArg(args["min-pool-tvl"], env.GMGN_MIN_POOL_TVL, 0),
   poolTypes: (args["pool-types"] || env.GMGN_POOL_TYPES || "dlmm").split(",").map((s) => s.trim()).filter(Boolean),
   once: Boolean(args.once),
   dryRun: Boolean(args["dry-run"]) || env.GMGN_DRY_RUN === "1",
   send: !args["no-send"] && telegramConfigured(),
-  outDir: args.out || env.GMGN_OUT_DIR || path.resolve("data"),
+  outDir: path.resolve(args.out || env.GMGN_OUT_DIR || path.join(ROOT, "data")),
   cookie: env.GMGN_COOKIE || null,
   apiKey: env.GMGN_API_KEY || null,
   clientId: env.GMGN_CLIENT_ID || null,
@@ -81,10 +104,10 @@ const CFG = {
 const CH2 = {
   token: env.TG2_BOT_TOKEN || null,
   chatId: env.TG2_CHAT_ID || null,
-  minVol: Number(args["ch2-min-vol"] ?? env.TG2_MIN_VOL_USD ?? 50000),
-  sustainMs: Number(args["ch2-sustain"] ?? env.TG2_SUSTAIN_MIN ?? 3) * 60000,
-  repeatMs: Number(args["ch2-repeat"] ?? env.TG2_REPEAT_SEC ?? 5) * 1000,
-  deleteAfterMs: Number(args["ch2-delete"] ?? env.TG2_DELETE_AFTER_SEC ?? 30) * 1000,
+  minVol: numArg(args["ch2-min-vol"], env.TG2_MIN_VOL_USD, 50000),
+  sustainMs: numArg(args["ch2-sustain"], env.TG2_SUSTAIN_MIN, 3) * 60000,
+  repeatMs: numArg(args["ch2-repeat"], env.TG2_REPEAT_SEC, 5) * 1000,
+  deleteAfterMs: numArg(args["ch2-delete"], env.TG2_DELETE_AFTER_SEC, 30) * 1000,
 };
 
 if (!PERIODS.includes(CFG.period)) {
@@ -127,19 +150,40 @@ const ch2 = new SustainedChannel({
 
 const clock = () => new Date().toISOString().replace("T", " ").slice(0, 19);
 
+/** Atomic JSON write: temp file + rename, so a crash cannot leave a half-written file. */
+function writeJsonAtomic(file, data) {
+  const tmp = `${file}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(data));
+  fs.renameSync(tmp, file);
+}
+
+/** Normalise legacy `msgIds: [123]` into `[{id, ts}]`. */
+function normalizeRecord(rec) {
+  if (!rec || !Array.isArray(rec.msgIds)) return rec;
+  rec.msgIds = rec.msgIds
+    .map((m) => (typeof m === "object" && m !== null ? m : { id: m, ts: rec.ts }))
+    .filter((m) => Number.isFinite(m.id));
+  return rec;
+}
+
 function loadSent() {
   try {
-    return JSON.parse(fs.readFileSync(sentPath, "utf8"));
+    const map = JSON.parse(fs.readFileSync(sentPath, "utf8"));
+    for (const rec of Object.values(map)) normalizeRecord(rec);
+    return map;
   } catch {
     return {};
   }
 }
+
 function saveSent(map) {
-  // keep entries long enough to cover both cooldown and the delete window
   const keepMs = Math.max(7 * 24 * 3600 * 1000, CFG.deleteAfterMs * 2);
   const cutoff = Date.now() - keepMs;
-  for (const [k, v] of Object.entries(map)) if (v.ts < cutoff && !v.msgIds?.length) delete map[k];
-  fs.writeFileSync(sentPath, JSON.stringify(map));
+  for (const [k, v] of Object.entries(map)) {
+    // never drop an entry that still has messages waiting to be deleted
+    if (v.ts < cutoff && !v.msgIds?.length) delete map[k];
+  }
+  writeJsonAtomic(sentPath, map);
 }
 
 const sent = loadSent();
@@ -148,39 +192,46 @@ const printed = new Map();
 
 /**
  * Delete bot messages whose retention window has passed.
- * Runs every scan cycle; each message id is attempted once per cycle until it is gone.
+ * Each id is retried on later cycles until Telegram confirms it is gone.
  */
 async function sweepDeletions() {
   if (!CFG.deleteAfterMs || !CFG.send || CFG.dryRun) return 0;
 
   const now = Date.now();
   let deleted = 0;
+  let dirty = false;
 
-  for (const [mint, rec] of Object.entries(sent)) {
+  for (const rec of Object.values(sent)) {
     if (!rec.msgIds?.length) continue;
-    if (now - rec.ts < CFG.deleteAfterMs) continue;
 
     const remaining = [];
-    for (const id of rec.msgIds) {
-      const r = await deleteTelegramMessage(id, {});
+    for (const m of rec.msgIds) {
+      if (now - m.ts < CFG.deleteAfterMs) {
+        remaining.push(m);
+        continue;
+      }
+      const r = await deleteTelegramMessage(m.id, {});
       if (r === "deleted" || r === "already-gone") {
         deleted++;
+        dirty = true;
       } else if (r === "too-old" || r === "forbidden") {
-        // unrecoverable — drop it so we stop retrying
-        console.error(`[${clock()}] delete msg ${id} (${rec.symbol}): ${r}`);
+        console.error(`[${clock()}] delete msg ${m.id} (${rec.symbol}): ${r}`);
+        dirty = true;
       } else {
-        remaining.push(id);
-        console.error(`[${clock()}] delete msg ${id} (${rec.symbol}) failed, will retry: ${r}`);
+        remaining.push(m); // retry next cycle
       }
     }
-    rec.msgIds = remaining;
-    if (!remaining.length) rec.deletedAt = now;
+    if (remaining.length !== rec.msgIds.length) {
+      rec.msgIds = remaining;
+      dirty = true;
+    }
+    if (!rec.msgIds.length) rec.deletedAt = now;
   }
 
   if (deleted) {
     console.log(`[${clock()}] retention: deleted ${deleted} message(s) older than ${CFG.deleteAfterMs / 60000}m`);
-    saveSent(sent);
   }
+  if (dirty) saveSent(sent);
   return deleted;
 }
 
@@ -220,7 +271,7 @@ async function scan() {
       `(vol>=${fmtUsd(CFG.minVolUsd)}, fee>=${CFG.minFeeSol} SOL, mcap>=${fmtUsd(CFG.minMcapUsd)}) | ${fresh.length} to check`
   );
 
-  const delivered = [];
+  let delivered = 0;
   let noPool = 0;
   let quiet = 0;
 
@@ -232,7 +283,7 @@ async function scan() {
       poolTypes: CFG.poolTypes,
     });
 
-    // no Meteora DLMM pool -> skip entirely: no notification, no cooldown, re-checked next poll
+    // no Meteora pool -> skip entirely: no notification, no cooldown, re-checked next poll
     if (!built) {
       noPool++;
       continue;
@@ -254,38 +305,58 @@ async function scan() {
     console.log("\n" + built.text + "\n" + "-".repeat(60));
     fs.appendFileSync(alertPath, `[${clock()}] ${t.symbol} ${t.address}\n${built.text}\n\n`);
 
+    const prev = sent[t.address]?.msgIds || [];
     try {
       const ids = await sendTelegramBlocks(built.blocks, {
-        header: `🚨 ${built.symbol}`,
+        header: `🚨 ${escHtml(built.symbol)}`,
       });
-      // cooldown starts only after Telegram accepted the message
+      // merge any still-pending older ids so they can still be deleted later
+      const merged = [...prev, ...ids.map((id) => ({ id, ts: now }))];
       sent[t.address] = {
         ts: now,
         symbol: t.symbol,
         volume: num(t.volume),
         msgId: ids[0],
-        msgIds: ids,
+        msgIds: merged,
         msgs: ids.length,
       };
-      delivered.push(t.address);
+      delivered++;
       console.log(`sent -> telegram ${ids.length} message(s), first id ${ids[0]}`);
     } catch (e) {
-      console.error(`telegram failed for ${t.symbol} (no cooldown applied, will retry): ${e.message}`);
+      if (e.sentIds?.length) {
+        // partial delivery: record what actually went out so it gets deleted later
+        const merged = [...prev, ...e.sentIds.map((id) => ({ id, ts: now }))];
+        sent[t.address] = {
+          ts: sent[t.address]?.ts || 0,
+          symbol: t.symbol,
+          volume: num(t.volume),
+          msgIds: merged,
+          msgs: e.sentIds.length,
+        };
+        console.error(
+          `telegram failed for ${t.symbol} after ${e.sentIds.length}/${e.totalChunks} messages — ` +
+            `recording those ids for cleanup, no cooldown applied: ${e.message}`
+        );
+      } else {
+        console.error(`telegram failed for ${t.symbol} (no cooldown applied, will retry): ${e.message}`);
+      }
     }
   }
 
   saveSent(sent);
-  if (noPool) console.log(`[${clock()}] ${noPool} token(s) skipped — no Meteora DLMM pool (not cooled down)`);
+  if (noPool) console.log(`[${clock()}] ${noPool} token(s) skipped — no Meteora pool (not cooled down)`);
   if (quiet) console.log(`[${clock()}] ${quiet} token(s) already shown in this window`);
-  return { hits: hits.length, fresh: fresh.length, delivered: delivered.length, noPool };
+  return { hits: hits.length, fresh: fresh.length, delivered, noPool };
 }
 
 let stopping = false;
-process.on("SIGINT", () => {
-  stopping = true;
-  console.log("\nstopped.");
-  process.exit(0);
-});
+for (const sig of ["SIGINT", "SIGTERM"]) {
+  process.on(sig, () => {
+    stopping = true;
+    console.log(`\n${sig} received, stopping.`);
+    process.exit(0);
+  });
+}
 
 (async () => {
   if (CFG.once) {
@@ -309,7 +380,7 @@ process.on("SIGINT", () => {
   );
   console.log(
     ch2.enabled
-      ? `ch2 up | @volumebasah | vol>=${fmtUsd(CH2.minVol)} for ${CH2.sustainMs / 60000}m | ` +
+      ? `ch2 up | vol>=${fmtUsd(CH2.minVol)} for ${CH2.sustainMs / 60000}m | ` +
           `fee>=${CFG.minFeeSol} SOL | mcap>=${fmtUsd(CFG.minMcapUsd)} | ` +
           `repeat ${CH2.repeatMs / 1000}s | delete after ${CH2.deleteAfterMs / 1000}s`
       : `ch2 off | set TG2_BOT_TOKEN + TG2_CHAT_ID to enable the sustained-volume channel`
