@@ -1,0 +1,16 @@
+# secrets — never commit
+.env
+.env.*
+!.env.example
+
+# runtime state
+data/
+logs/
+*.log
+
+# deps / editor / OS
+node_modules/
+.DS_Store
+*.swp
+.idea/
+.vscode/

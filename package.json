@@ -1,0 +1,14 @@
+{
+  "name": "gmgn-volume-monitor",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Monitor Solana token volume on GMGN (public quotation endpoint or official OpenAPI)",
+  "engines": { "node": ">=18" },
+  "bin": { "gmgn-vol": "./src/monitor.js" },
+  "scripts": {
+    "start": "node src/monitor.js",
+    "once": "node src/monitor.js --once",
+    "test": "node test/mock.test.mjs"
+  }
+}
