@@ -43,6 +43,35 @@ Butuh **Node.js 18 atau lebih baru**. Tidak ada dependency, jadi tidak perlu `np
 ./run.sh restart    # stop + start (pakai ini setelah ubah .env)
 ```
 
+### Cara update
+
+```bash
+cd ~/gmgn-volume-scanner
+./run.sh stop
+git pull
+./run.sh test        # pastikan tidak ada yang rusak
+./run.sh start
+```
+
+`.env` tidak akan tersentuh — file itu di-`.gitignore`, jadi tidak pernah ikut tertimpa.
+
+Kalau `git pull` menolak karena ada perubahan lokal di file source:
+
+```bash
+git stash            # simpan perubahan lokal
+git pull
+git stash pop        # kembalikan perubahan lokal
+```
+
+Atau, kalau perubahan lokal memang tidak diperlukan:
+
+```bash
+git fetch origin
+git reset --hard origin/main   # HAPUS perubahan lokal di file yang dilacak git
+```
+
+`data/` dan `logs/` aman di kedua cara — keduanya tidak dilacak git.
+
 ### Perintah bantu
 
 ```bash
